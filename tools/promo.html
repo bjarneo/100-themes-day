@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Promo renderer</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c" width="1920" height="1080"></canvas>
+<script>
+// Promo video frames. tools/promo.mjs calls setup(), prepare() and frame().
+
+const W = 1920, H = 1080, SIDE = 96;
+const MONO = '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace';
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let S = null, LOGO = [], images = new Map(), mosaic = null;
+
+function rgba(hex, a) { const n = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)); return `rgba(${n[0]},${n[1]},${n[2]},${a})`; }
+function ease(t) { t = Math.max(0, Math.min(1, t)); return 1 - Math.pow(1 - t, 3); }
+function load(src) { return new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = rej; im.src = src; }); }
+
+window.setup = async (config) => {
+  S = config;
+  LOGO = config.logo.map(p => ({ path: new Path2D(p.d), rule: p.evenodd ? 'evenodd' : 'nonzero' }));
+  mosaic = await load(config.mosaic);
+  await document.fonts.load(`40px ${MONO}`);
+  await document.fonts.load(`bold 40px ${MONO}`);
+};
+
+// Keeps the screenshots of the current and the next theme in memory only.
+window.prepare = async (j) => {
+  for (const k of [...images.keys()]) if (k < j - 1) images.delete(k);
+  for (const k of [j, j + 1]) if (k < S.themes.length && !images.has(k)) images.set(k, await load(S.themes[k].shot));
+};
+
+function drawLogo(x, y, width, fill, alpha = 1) {
+  const s = width / 1215;
+  ctx.save(); ctx.globalAlpha = alpha; ctx.translate(x, y); ctx.scale(s, s);
+  ctx.fillStyle = fill; LOGO.forEach(p => ctx.fill(p.path, p.rule));
+  ctx.restore();
+}
+
+function logoGradient(t) {
+  const g = ctx.createLinearGradient(0, 0, 1215, 0);
+  g.addColorStop(0, t.ansi[6]); g.addColorStop(1, t.ansi[5]);
+  return g;
+}
+
+function glowLogo(x, y, width, t, alpha) {
+  ctx.save(); ctx.shadowColor = rgba(t.colors.accent, .8 * alpha); ctx.shadowBlur = 60;
+  drawLogo(x, y, width, logoGradient(t), alpha);
+  ctx.shadowBlur = 20; drawLogo(x, y, width, logoGradient(t), alpha);
+  ctx.restore();
+}
+
+function text(str, x, y, size, color, opts = {}) {
+  ctx.save();
+  ctx.font = `${opts.bold ? 'bold ' : ''}${size}px ${MONO}`;
+  ctx.fillStyle = color; ctx.textAlign = opts.align || 'left'; ctx.textBaseline = opts.baseline || 'alphabetic';
+  if (opts.glow) { ctx.shadowColor = opts.glow; ctx.shadowBlur = opts.blur || 24; }
+  if (opts.alpha !== undefined) ctx.globalAlpha = opts.alpha;
+  if (opts.spacing) ctx.letterSpacing = opts.spacing;
+  ctx.fillText(str, x, y);
+  ctx.restore();
+}
+
+function intro(f, n) {
+  const t = S.intro;
+  ctx.fillStyle = t.colors.darker_background; ctx.fillRect(0, 0, W, H);
+  const glow = ctx.createRadialGradient(W / 2, H * .45, 0, W / 2, H * .45, W * .5);
+  glow.addColorStop(0, rgba(t.colors.accent, .18 * ease(f / 20))); glow.addColorStop(1, rgba(t.colors.accent, 0));
+  ctx.fillStyle = glow; ctx.fillRect(0, 0, W, H);
+  // Neon tube start: two short flickers before the logo stays on
+  const flicker = f < 4 ? 0 : f < 6 ? .8 : f < 8 ? .15 : f < 10 ? 1 : f < 11 ? .4 : 1;
+  const width = 900 + 40 * ease(f / n);
+  glowLogo((W - width) / 2, H * .42 - width * 285 / 1215 / 2, width, t, flicker);
+  const a = ease((f - 24) / 14);
+  text('100 DAY THEMES', W / 2, H * .64, 40, t.colors.foreground, { align: 'center', bold: true, alpha: a, spacing: '10px', glow: rgba(t.ansi[6], .6) });
+  // ANSI strip
+  const sw = 54, gap = 10, x0 = W / 2 - (8 * sw + 7 * gap) / 2;
+  for (let k = 0; k < 16; k++) {
+    const a2 = ease((f - 36 - (k % 8) * 2) / 8);
+    ctx.fillStyle = rgba(t.ansi[k], a2);
+    ctx.fillRect(x0 + (k % 8) * (sw + gap), H * .7 + Math.floor(k / 8) * 22, sw, 14);
+  }
+  fadeEdges(f, n);
+}
+
+function card(j, f, n) {
+  const t = S.themes[j], c = t.colors, img = images.get(j);
+  ctx.fillStyle = c.darker_background; ctx.fillRect(0, 0, W, H);
+
+  // Screenshot with a short zoom on the beat
+  const z = 1 + .045 * (1 - ease(f / 9));
+  const sw = W - SIDE * 2, sh = H;
+  ctx.save();
+  ctx.beginPath(); ctx.rect(SIDE, 0, sw, sh); ctx.clip();
+  const iw = sw * z, ih = iw * img.height / img.width;
+  ctx.drawImage(img, SIDE + (sw - iw) / 2, (sh - ih) / 2, iw, ih);
+  ctx.restore();
+
+  // ANSI columns: normal colors left, bright colors right
+  const sq = 44, gap = 14, y0 = (H - (8 * sq + 7 * gap)) / 2;
+  for (let k = 0; k < 8; k++) {
+    const d = ease((f - k) / 5);
+    ctx.fillStyle = t.ansi[k]; ctx.fillRect(SIDE / 2 - sq / 2 - (1 - d) * 60, y0 + k * (sq + gap), sq, sq);
+    ctx.fillStyle = t.ansi[k + 8]; ctx.fillRect(W - SIDE / 2 - sq / 2 + (1 - d) * 60, y0 + k * (sq + gap), sq, sq);
+  }
+
+  // Name label
+  const a = ease(f / 6), dx = (1 - a) * -40;
+  ctx.save(); ctx.globalAlpha = a;
+  ctx.font = `bold 64px ${MONO}`;
+  const nameW = ctx.measureText(t.name).width;
+  const bx = SIDE + 40 + dx, bh = 150, by = H - 60 - bh, bw = Math.max(nameW, 330) + 72;
+  ctx.fillStyle = rgba(c.background, .92); ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 16); ctx.fill();
+  ctx.lineWidth = 3;
+  const border = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+  border.addColorStop(0, t.ansi[6]); border.addColorStop(1, t.ansi[5]);
+  ctx.strokeStyle = border; ctx.stroke();
+  ctx.restore();
+  text(`${String(j + 1).padStart(3, '0')} / 100`, bx + 36, by + 50, 26, c.dark_foreground, { alpha: a, spacing: '2px' });
+  text(t.name, bx + 36, by + 118, 64, c.bright_foreground, { bold: true, alpha: a, glow: rgba(c.accent, .7), blur: 22 });
+
+  // Progress bar
+  const p = (j + f / n) / S.themes.length;
+  const g = ctx.createLinearGradient(SIDE, 0, W - SIDE, 0);
+  g.addColorStop(0, t.ansi[6]); g.addColorStop(1, t.ansi[5]);
+  ctx.fillStyle = rgba(c.darker_background, .8); ctx.fillRect(SIDE, H - 8, sw, 8);
+  ctx.fillStyle = g; ctx.fillRect(SIDE, H - 8, sw * p, 8);
+}
+
+function outro(f, n) {
+  const t = S.intro;
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H);
+  const a = ease(f / 10);
+  ctx.save(); ctx.globalAlpha = a;
+  const z = 1.08 - .08 * ease(f / n);
+  const iw = W * z, ih = iw * mosaic.height / mosaic.width;
+  ctx.drawImage(mosaic, (W - iw) / 2, (H - ih) / 2, iw, ih);
+  ctx.restore();
+  ctx.fillStyle = rgba(t.colors.darker_background, .72 * ease((f - 20) / 12)); ctx.fillRect(0, 0, W, H);
+  const b = ease((f - 26) / 12);
+  glowLogo((W - 760) / 2, H * .36, 760, t, b);
+  text('100 DAY THEMES', W / 2, H * .6, 38, t.colors.foreground, { align: 'center', bold: true, alpha: b, spacing: '8px' });
+  text(S.url, W / 2, H * .68, 32, t.ansi[14], { align: 'center', alpha: ease((f - 40) / 12), glow: rgba(t.ansi[6], .6) });
+  fadeEdges(f, n);
+}
+
+function fadeEdges(f, n) {
+  const a = f < 6 ? 1 - f / 6 : f > n - 12 && S.fadeOutEnd ? (f - (n - 12)) / 12 : 0;
+  if (a > 0) { ctx.fillStyle = `rgba(255,255,255,${a})`; ctx.fillRect(0, 0, W, H); }
+}
+
+window.frame = (seg, f, n, quality = .93) => {
+  if (seg.kind === 'intro') intro(f, n);
+  else if (seg.kind === 'outro') { S.fadeOutEnd = true; outro(f, n); }
+  else card(seg.index, f, n);
+  return cv.toDataURL('image/jpeg', quality);
+};
+</script>
+</body>
+</html>

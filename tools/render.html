@@ -1,0 +1,723 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Theme renderer</title>
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Background renderer. tools/render.mjs loads this page in headless Chromium
+// and calls window.renderImage(). All drawing uses a 3840x2160 design space.
+
+const W = 3840, H = 2160;
+const MONO = '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace';
+let LOGO = [];
+
+window.setLogo = paths => { LOGO = paths.map(p => ({ path: new Path2D(p.d), rule: p.evenodd ? 'evenodd' : 'nonzero' })); };
+
+// ---------- helpers ----------
+
+function rng(seed) {
+  return () => {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function rgb(hex) { return [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)); }
+function rgba(hex, a) { const [r, g, b] = rgb(hex); return `rgba(${r},${g},${b},${a})`; }
+function mix(a, b, t) {
+  const pa = rgb(a), pb = rgb(b);
+  return '#' + pa.map((v, i) => Math.round(v * (1 - t) + pb[i] * t).toString(16).padStart(2, '0')).join('');
+}
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function smooth(t) { return t * t * (3 - 2 * t); }
+
+function layer(w = W, h = H) {
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  return [cv, cv.getContext('2d')];
+}
+
+// Seeded 2D gradient noise.
+function makeNoise(seed) {
+  const r = rng(seed), perm = new Uint8Array(512), grad = [];
+  const p = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [p[i], p[j]] = [p[j], p[i]]; }
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+  for (let i = 0; i < 256; i++) { const a = r() * Math.PI * 2; grad.push([Math.cos(a), Math.sin(a)]); }
+  const dot = (ix, iy, x, y) => { const g = grad[perm[ix + perm[iy & 255]]]; return g[0] * (x - ix) + g[1] * (y - iy); };
+  const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+  function n(x, y) {
+    const x0 = Math.floor(x), y0 = Math.floor(y), sx = fade(x - x0), sy = fade(y - y0);
+    const X = x0 & 255, Y = y0 & 255, fx = x - x0, fy = y - y0;
+    const d = (dx, dy) => { const g = grad[perm[((X + dx) & 255) + perm[(Y + dy) & 255]]]; return g[0] * (fx - dx) + g[1] * (fy - dy); };
+    return lerp(lerp(d(0, 0), d(1, 0), sx), lerp(d(0, 1), d(1, 1), sx), sy);
+  }
+  n.fbm = (x, y, oct = 5) => { let s = 0, a = .5, f = 1; for (let i = 0; i < oct; i++) { s += a * n(x * f, y * f); a *= .5; f *= 2; } return s; };
+  return n;
+}
+
+// Draws a layer three times: two blurred passes for the glow, then the sharp pass.
+function bloom(ctx, draw, radii = [90, 28], strength = [.85, .9]) {
+  const [cv, lx] = layer();
+  draw(lx);
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  radii.forEach((r, i) => { ctx.filter = `blur(${r}px)`; ctx.globalAlpha = strength[i]; ctx.drawImage(cv, 0, 0); });
+  ctx.filter = 'none'; ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(cv, 0, 0);
+  ctx.restore();
+}
+
+function vignette(ctx, P, amount = .3) {
+  const g = ctx.createRadialGradient(W / 2, H / 2, H * .4, W / 2, H / 2, W * .64);
+  g.addColorStop(0, rgba(P.c[8], 0));
+  g.addColorStop(1, rgba(P.c[8], amount));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+// A soft colored halo for light backgrounds. It replaces the additive bloom
+// of the night renderer, which washes out on a light background.
+function halo(ctx, draw, radii = [70, 20], strength = [.35, .3]) {
+  const [cv, lx] = layer();
+  draw(lx);
+  ctx.save();
+  radii.forEach((r, i) => { ctx.filter = `blur(${r}px)`; ctx.globalAlpha = strength[i]; ctx.drawImage(cv, 0, 0); });
+  ctx.restore();
+  ctx.drawImage(cv, 0, 0);
+}
+
+// A soft shadow under a layer, as if the light comes from the top left.
+function dropShadow(ctx, draw, dx = 14, dy = 20, blur = 26, alpha = .22, color = '#000000') {
+  const [cv, lx] = layer();
+  draw(lx);
+  const [sv, sx] = layer();
+  sx.drawImage(cv, 0, 0);
+  sx.globalCompositeOperation = 'source-in'; sx.fillStyle = color; sx.fillRect(0, 0, W, H);
+  ctx.save(); ctx.filter = `blur(${blur}px)`; ctx.globalAlpha = alpha; ctx.drawImage(sv, dx, dy); ctx.restore();
+  ctx.drawImage(cv, 0, 0);
+}
+
+const tint = (P, k, t) => mix(P.bg, P.c[k], t);
+
+// Fine grain hides gradient banding after JPEG compression.
+function grain(ctx, seed, alpha = .05) {
+  const [cv, gx] = layer(256, 256), r = rng(seed), img = gx.createImageData(256, 256);
+  for (let i = 0; i < img.data.length; i += 4) { const v = r() * 255; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+  gx.putImageData(img, 0, 0);
+  ctx.save();
+  ctx.globalAlpha = alpha; ctx.globalCompositeOperation = 'overlay';
+  ctx.fillStyle = ctx.createPattern(cv, 'repeat'); ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+function stars(ctx, r, count, yMax, colors, maxSize = 3.2) {
+  for (let i = 0; i < count; i++) {
+    const x = r() * W, y = Math.pow(r(), 1.4) * yMax, s = Math.pow(r(), 3) * maxSize + .6;
+    ctx.fillStyle = rgba(colors[Math.floor(r() * colors.length)], .25 + r() * .75);
+    ctx.beginPath(); ctx.arc(x, y, s, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function skyGradient(ctx, stops) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  stops.forEach(([o, c]) => g.addColorStop(o, c));
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+
+function ridge(r, noise, base, amp, freq, seedShift) {
+  const pts = [];
+  for (let x = -20; x <= W + 20; x += 12) pts.push([x, base - Math.abs(noise.fbm(x * freq + seedShift, seedShift, 4)) * amp - noise.fbm(x * freq * 3, seedShift + 9, 2) * amp * .25]);
+  return pts;
+}
+
+function fillRidge(ctx, pts, color) {
+  ctx.beginPath(); ctx.moveTo(pts[0][0], H);
+  pts.forEach(([x, y]) => ctx.lineTo(x, y));
+  ctx.lineTo(pts[pts.length - 1][0], H); ctx.closePath();
+  ctx.fillStyle = color; ctx.fill();
+}
+
+function strokeRidge(ctx, pts, color, width) {
+  ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+  ctx.strokeStyle = color; ctx.lineWidth = width; ctx.stroke();
+}
+
+// ---------- the wordmark background ----------
+
+function drawLogo(ctx, x, y, scale, fill) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(scale, scale);
+  ctx.fillStyle = fill;
+  LOGO.forEach(p => ctx.fill(p.path, p.rule));
+  ctx.restore();
+}
+
+function wordmark(ctx, P, r) {
+  ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+  const glow = ctx.createRadialGradient(W / 2, H * .47, 0, W / 2, H * .47, W * .55);
+  glow.addColorStop(0, rgba(P.accent, .1));
+  glow.addColorStop(.5, rgba(P.c[4], .04));
+  glow.addColorStop(1, rgba(P.bg, 0));
+  ctx.fillStyle = glow; ctx.fillRect(0, 0, W, H);
+
+  for (let y = 60; y < H; y += 72) for (let x = 60; x < W; x += 72) {
+    const d = Math.hypot(x - W / 2, (y - H * .47) * 1.6) / W;
+    ctx.fillStyle = rgba(P.c[8], clamp(.55 - d * .5, .15, .55));
+    ctx.fillRect(x - 2, y - 2, 4, 4);
+  }
+
+  const scale = 1560 / 1215, lw = 1215 * scale, lh = 285 * scale;
+  const lx = (W - lw) / 2, ly = H * .47 - lh / 2;
+  const grad = ctx.createLinearGradient(0, 0, 1215, 0);
+  grad.addColorStop(0, P.c[6]); grad.addColorStop(.5, mix(P.c[6], P.c[5], .5)); grad.addColorStop(1, P.c[5]);
+
+  const [rcv, rx] = layer();
+  rx.save(); rx.translate(0, (ly + lh) * 2 + 40); rx.scale(1, -1); drawLogo(rx, lx, ly, scale, grad); rx.restore();
+  const mask = rx.createLinearGradient(0, ly + lh + 40, 0, ly + lh + 40 + lh * .8);
+  mask.addColorStop(0, 'rgba(0,0,0,.14)'); mask.addColorStop(1, 'rgba(0,0,0,0)');
+  rx.globalCompositeOperation = 'destination-in'; rx.fillStyle = mask; rx.fillRect(0, 0, W, H);
+  ctx.save(); ctx.filter = 'blur(4px)'; ctx.drawImage(rcv, 0, 0); ctx.restore();
+
+  halo(ctx, lx2 => drawLogo(lx2, lx, ly, scale, grad), [110, 30], [.28, .22]);
+
+  const sw = 52, gap = 14, cols = [1, 2, 3, 4, 5, 6];
+  const total = cols.length * sw + (cols.length - 1) * gap, sx = (W - total) / 2, sy = ly + lh + 300;
+  cols.forEach((k, i) => {
+    ctx.fillStyle = P.c[k]; ctx.fillRect(sx + i * (sw + gap), sy, sw, 10);
+    ctx.fillStyle = P.c[k + 8]; ctx.fillRect(sx + i * (sw + gap), sy + 18, sw, 10);
+  });
+
+  vignette(ctx, P, .22);
+  grain(ctx, P.index * 31, .035);
+}
+
+// ---------- native motifs, day versions ----------
+
+const MOTIFS = {};
+
+function cloudField(ctx, P, noise, colors, opts = {}) {
+  const cw = 480, ch = 270, [cv, cx] = layer(cw, ch), img = cx.createImageData(cw, ch);
+  const cols = colors.map(rgb), sc = opts.scale || 2.4, band = opts.band ?? .55;
+  for (let y = 0; y < ch; y++) for (let x = 0; x < cw; x++) {
+    const u = x / cw, v = y / ch;
+    const warp = noise.fbm(u * 2 + 11, v * 2 + 3, 3) * 1.4;
+    let d = noise.fbm(u * sc + warp, v * sc * .6 - warp, 6) * .5 + .5;
+    const diag = Math.abs((v - (opts.center ?? .5)) - (u - .5) * (opts.tilt ?? -.45));
+    d *= clamp(1 - diag / band, 0, 1);
+    d = clamp((d - .28) * 1.9, 0, 1);
+    const hue = clamp(noise.fbm(u * 1.3 + 40, v * 1.3, 3) * .9 + .5, 0, .999) * (cols.length - 1);
+    const i0 = Math.floor(hue), t = hue - i0, a = cols[i0], b = cols[Math.min(i0 + 1, cols.length - 1)];
+    const k = (y * cw + x) * 4;
+    img.data[k] = lerp(a[0], b[0], t); img.data[k + 1] = lerp(a[1], b[1], t); img.data[k + 2] = lerp(a[2], b[2], t);
+    img.data[k + 3] = Math.min(255, Math.pow(d, 1.2) * 300 * (opts.alpha ?? .9));
+  }
+  cx.putImageData(img, 0, 0);
+  ctx.save(); ctx.imageSmoothingQuality = 'high'; ctx.globalCompositeOperation = opts.comp || 'multiply';
+  ctx.filter = 'blur(18px)'; ctx.drawImage(cv, 0, 0, W, H);
+  ctx.filter = 'blur(3px)'; ctx.globalAlpha = .5; ctx.drawImage(cv, 0, 0, W, H);
+  ctx.restore();
+}
+
+// Morning sun over a perspective grid.
+MOTIFS['sunset-grid'] = (ctx, P, r, noise) => {
+  const hz = H * .6;
+  skyGradient(ctx, [[0, tint(P, 4, .22)], [.35, P.bg], [.55, tint(P, 5, .22)], [.6, tint(P, 3, .3)], [.6001, tint(P, 5, .1)], [1, tint(P, 5, .16)]]);
+  const [scv, sx] = layer();
+  const sr = 560, scx = W / 2, scy = hz - 150;
+  const sg = sx.createLinearGradient(0, scy - sr, 0, scy + sr);
+  sg.addColorStop(0, tint(P, 3, .3)); sg.addColorStop(.5, mix(tint(P, 3, .55), tint(P, 1, .55), .5)); sg.addColorStop(1, tint(P, 1, .75));
+  sx.fillStyle = sg; sx.beginPath(); sx.arc(scx, scy, sr, 0, Math.PI * 2); sx.fill();
+  sx.globalCompositeOperation = 'destination-out';
+  for (let i = 0; i < 9; i++) { const y = scy + 30 + i * i * 7 + i * 34, h = 6 + i * 4.2; sx.fillRect(0, y, W, h); }
+  sx.globalCompositeOperation = 'source-over';
+  sx.clearRect(0, hz, W, H);
+  ctx.save(); ctx.filter = 'blur(120px)'; ctx.globalAlpha = .35; ctx.drawImage(scv, 0, 0); ctx.restore();
+  ctx.drawImage(scv, 0, 0);
+
+  const far = ridge(r, noise, hz, 360, .0011, 3);
+  fillRidge(ctx, far, tint(P, 4, .3));
+  strokeRidge(ctx, far, rgba(P.c[4], .6), 3);
+  const near = ridge(r, noise, hz + 4, 190, .0021, 11);
+  fillRidge(ctx, near, tint(P, 5, .45));
+  strokeRidge(ctx, near, P.c[5], 3.5);
+  ctx.fillStyle = tint(P, 5, .1); ctx.fillRect(0, hz, W, H - hz);
+
+  halo(ctx, lx => {
+    lx.lineWidth = 3;
+    for (let i = -40; i <= 40; i++) {
+      const bx = W / 2 + i * 230;
+      const g = lx.createLinearGradient(0, hz, 0, H);
+      g.addColorStop(0, rgba(P.c[5], 0)); g.addColorStop(.35, rgba(P.c[5], .55)); g.addColorStop(1, rgba(P.c[5], .9));
+      lx.strokeStyle = g; lx.beginPath(); lx.moveTo(W / 2 + i * 12, hz); lx.lineTo(W / 2 + (bx - W / 2) * 6, H + 1400); lx.stroke();
+    }
+    for (let k = 1; k < 40; k++) {
+      const y = hz + Math.pow(k, 2.1) * 3.2;
+      if (y > H) break;
+      lx.strokeStyle = rgba(P.c[5], clamp((y - hz) / 300, .12, .85)); lx.lineWidth = 2 + (y - hz) / 400;
+      lx.beginPath(); lx.moveTo(0, y); lx.lineTo(W, y); lx.stroke();
+    }
+    lx.fillStyle = P.c[6]; lx.fillRect(0, hz - 2, W, 4);
+  }, [40, 12], [.25, .2]);
+  vignette(ctx, P, .2);
+  grain(ctx, P.index * 17, .04);
+};
+
+// Code glyphs that fall on paper.
+MOTIFS['code-rain'] = (ctx, P, r) => {
+  skyGradient(ctx, [[0, P.bg], [1, tint(P, 2, .08)]]);
+  const glyphs = 'ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789ABCDEF<>/{}[]=+*';
+  const size = 40, colW = 46;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  for (let col = 0; col * colW < W + colW; col++) {
+    const x = col * colW + colW / 2, depth = r();
+    const font = Math.round(size * (.7 + depth * .45));
+    const streams = 1 + Math.floor(r() * 2.2);
+    for (let s = 0; s < streams; s++) {
+      const len = 8 + Math.floor(r() * 34), headY = r() * (H + 600) - 200;
+      for (let k = 0; k < len; k++) {
+        const y = headY - k * font * 1.05;
+        if (y < -font || y > H) continue;
+        const t = k / len;
+        ctx.font = `${k === 0 ? 'bold ' : ''}${font}px ${MONO}`;
+        ctx.fillStyle = rgba(k === 0 ? P.c[10] : t < .25 ? P.c[2] : P.c[6], (1 - t) * (.25 + depth * .6));
+        ctx.fillText(glyphs[Math.floor(r() * glyphs.length)], x, y);
+      }
+    }
+  }
+  vignette(ctx, P, .2);
+  grain(ctx, P.index * 13, .03);
+};
+
+// Watercolor clouds on a light sky.
+MOTIFS['nebula'] = (ctx, P, r, noise) => {
+  skyGradient(ctx, [[0, tint(P, 4, .12)], [1, P.bg]]);
+  cloudField(ctx, P, noise, [tint(P, 4, .55), tint(P, 5, .55), tint(P, 1, .5), tint(P, 13, .5), tint(P, 6, .55)], { tilt: -.5 + r() * .3, band: .6, alpha: .8 });
+  cloudField(ctx, P, makeNoise(P.index * 3 + 1), [tint(P, 12, .45), tint(P, 5, .45)], { tilt: -.3, band: .35, alpha: .5, scale: 4 });
+  halo(ctx, lx => {
+    for (let i = 0; i < 22; i++) {
+      const x = r() * W, y = r() * H, s = 3 + r() * 5, col = [P.c[5], P.c[4], P.c[6]][i % 3];
+      lx.fillStyle = col; lx.beginPath(); lx.arc(x, y, s, 0, Math.PI * 2); lx.fill();
+      lx.strokeStyle = rgba(col, .6); lx.lineWidth = 1.5;
+      lx.beginPath(); lx.moveTo(x - s * 12, y); lx.lineTo(x + s * 12, y); lx.moveTo(x, y - s * 12); lx.lineTo(x, y + s * 12); lx.stroke();
+    }
+  }, [16], [.3]);
+  vignette(ctx, P, .2);
+  grain(ctx, P.index * 7, .04);
+};
+
+// Pastel light curtains over a mountain lake.
+MOTIFS['aurora'] = (ctx, P, r, noise) => {
+  const hz = H * .72;
+  skyGradient(ctx, [[0, tint(P, 4, .18)], [.7, P.bg], [1, tint(P, 6, .12)]]);
+  const [acv, ax] = layer();
+  const bands = [[P.c[2], P.c[6], .34, 0], [P.c[6], P.c[4], .26, 50], [P.c[10], P.c[5], .3, 90]];
+  bands.forEach(([low, high, base, off], bi) => {
+    for (let x = 0; x < W; x += 4) {
+      const u = x / W;
+      const y = H * (base + .14 * noise.fbm(u * 2.2 + off, bi * 3, 3) + .05 * Math.sin(u * 7 + bi));
+      const inten = clamp(noise.fbm(u * 9 + off, bi * 7 + 1, 3) * 1.4 + .45, 0, 1) * (.4 + .6 * Math.sin(u * Math.PI));
+      const len = 380 + 520 * clamp(noise(u * 5 + off, bi + 20) + .5, 0, 1);
+      const g = ax.createLinearGradient(0, y, 0, y - len);
+      g.addColorStop(0, rgba(low, 0)); g.addColorStop(.06, rgba(low, .6 * inten));
+      g.addColorStop(.45, rgba(high, .32 * inten)); g.addColorStop(1, rgba(high, 0));
+      ax.fillStyle = g; ax.fillRect(x, y - len, 4, len);
+    }
+  });
+  ctx.save(); ctx.filter = 'blur(8px)'; ctx.globalCompositeOperation = 'multiply'; ctx.drawImage(acv, 0, 0); ctx.restore();
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, hz, W, H - hz); ctx.clip();
+  const lake = ctx.createLinearGradient(0, hz, 0, H);
+  lake.addColorStop(0, tint(P, 6, .08)); lake.addColorStop(1, tint(P, 4, .22));
+  ctx.fillStyle = lake; ctx.fillRect(0, hz, W, H - hz);
+  ctx.translate(0, hz * 2); ctx.scale(1, -1); ctx.globalAlpha = .45; ctx.filter = 'blur(14px)'; ctx.globalCompositeOperation = 'multiply';
+  ctx.drawImage(acv, 0, 0);
+  ctx.restore();
+  // Mountains on their own layer, cut at the shore line, with a mirror image in the lake
+  const [mcv, mx] = layer();
+  const far = ridge(r, noise, hz, 420, .0012, 5);
+  fillRidge(mx, far, tint(P, 4, .3));
+  strokeRidge(mx, far, rgba('#ffffff', .7), 3);
+  const near = ridge(r, noise, hz + 2, 200, .003, 17);
+  fillRidge(mx, near, tint(P, 4, .5));
+  mx.clearRect(0, hz + 2, W, H);
+  ctx.drawImage(mcv, 0, 0);
+  ctx.save(); ctx.translate(0, (hz + 2) * 2); ctx.scale(1, -1); ctx.globalAlpha = .35; ctx.filter = 'blur(5px)'; ctx.drawImage(mcv, 0, 0); ctx.restore();
+  ctx.fillStyle = rgba('#ffffff', .5);
+  for (let i = 0; i < 60; i++) ctx.fillRect(r() * W, hz + 20 + Math.pow(r(), 1.5) * (H - hz), 40 + r() * 160, 2);
+  ctx.fillStyle = rgba('#ffffff', .6); ctx.fillRect(0, hz + 8, W, 2);
+  vignette(ctx, P, .18);
+  grain(ctx, P.index * 5, .035);
+};
+
+// A city skyline in daylight.
+MOTIFS['skyline'] = (ctx, P, r, noise) => {
+  const street = H * .8;
+  skyGradient(ctx, [[0, tint(P, 6, .22)], [.7, P.bg], [1, tint(P, 4, .15)]]);
+  cloudField(ctx, P, noise, ['#ffffff', tint(P, 6, .1)], { alpha: .7, band: .35, tilt: 0, center: .25, comp: 'source-over' });
+  const [ccv, cx] = layer();
+  const layers = [[.5, tint(P, 4, .18), 180, .4], [.62, tint(P, 4, .32), 240, .7], [.72, mix(P.c[4], P.fg, .45), 300, 1]];
+  const signs = [];
+  layers.forEach(([top, color, wAvg, depth], li) => {
+    let x = -50;
+    while (x < W + 50) {
+      const bw = wAvg * (.5 + r()), bh = H * (1 - top) * (.35 + r() * .75) * (li === 0 ? 1.2 : 1);
+      const by = street - bh;
+      cx.fillStyle = color; cx.fillRect(x, by, bw, bh + 10);
+      // Light side of the building
+      cx.fillStyle = rgba('#ffffff', .1 * depth); cx.fillRect(x, by, bw * .3, bh + 10);
+      if (r() < .3) { cx.fillStyle = color; cx.fillRect(x + bw * .45, by - 80, 6, 80); }
+      const ww = 10 + li * 4, wh = 16 + li * 5;
+      for (let wy = by + 30; wy < street - 20; wy += wh * 2.1) for (let wx = x + 14; wx < x + bw - 14; wx += ww * 2.4) {
+        const sky = r() < .5;
+        cx.fillStyle = sky ? rgba(tint(P, 6, .35), .5 * depth) : rgba(P.fg, .12 * depth);
+        cx.fillRect(wx, wy, ww, wh);
+      }
+      if (li > 0 && r() < .4) signs.push({ x: x + bw * (.15 + r() * .6), y: by + 60 + r() * bh * .3, h: 160 + r() * 380, color: [P.c[5], P.c[6], P.c[1], P.c[3], P.c[13]][Math.floor(r() * 5)], horiz: r() < .35 });
+      x += bw + 6 + r() * 30;
+    }
+  });
+  ctx.drawImage(ccv, 0, 0);
+  dropShadow(ctx, lx => {
+    signs.forEach(n => {
+      lx.strokeStyle = n.color; lx.lineWidth = 7;
+      if (n.horiz) lx.strokeRect(n.x - n.h * .4, n.y, n.h * .8, 70);
+      else { lx.strokeRect(n.x, n.y, 60, n.h); lx.fillStyle = n.color; for (let k = 1; k < 4; k++) lx.fillRect(n.x + 18, n.y + k * n.h / 4 - 10, 24, 12); }
+    });
+  }, 6, 8, 10, .25);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, street, W, H - street); ctx.clip();
+  ctx.fillStyle = tint(P, 4, .12); ctx.fillRect(0, street, W, H - street);
+  ctx.translate(0, street * 2); ctx.scale(1, -1); ctx.globalAlpha = .25; ctx.filter = 'blur(8px)';
+  ctx.drawImage(ccv, 0, 0);
+  ctx.restore();
+  vignette(ctx, P, .18);
+  grain(ctx, P.index * 3, .035);
+};
+
+// An LED spectrum analyzer on a light panel.
+MOTIFS['equalizer'] = (ctx, P, r, noise) => {
+  skyGradient(ctx, [[0, P.bg], [1, tint(P, 5, .08)]]);
+  ctx.strokeStyle = rgba(P.c[8], .35); ctx.lineWidth = 2;
+  for (let y = 120; y < H; y += 120) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+  const base = H * .66, n = 64, bw = 34, gap = 16, total = n * (bw + gap) - gap, x0 = (W - total) / 2;
+  const heights = [], p1 = .15 + r() * .35, p2 = .55 + r() * .35, w1 = 2 + r() * 2.5, w2 = 2.5 + r() * 3, a2 = .4 + r() * .5;
+  for (let i = 0; i < n; i++) {
+    const u = i / (n - 1);
+    const env = Math.exp(-Math.pow((u - p1) * w1, 2)) * .9 + Math.exp(-Math.pow((u - p2) * w2, 2)) * a2 + .12;
+    heights.push(clamp(env * (.55 + .45 * (noise(u * 9, 3) + .5)) + (r() - .5) * .12, .05, 1) * 900);
+  }
+  const drawBars = lx => {
+    const g = lx.createLinearGradient(0, base, 0, base - 900);
+    g.addColorStop(0, P.c[6]); g.addColorStop(.5, P.c[5]); g.addColorStop(1, P.c[1]);
+    lx.fillStyle = g;
+    heights.forEach((h, i) => { const x = x0 + i * (bw + gap); for (let y = base - 14; y > base - h; y -= 24) lx.fillRect(x, y, bw, 14); });
+    lx.fillStyle = P.fg;
+    heights.forEach((h, i) => lx.fillRect(x0 + i * (bw + gap), base - h - 44, bw, 8));
+  };
+  halo(ctx, drawBars, [50, 14], [.25, .2]);
+  const [rcv, rx] = layer(); drawBars(rx);
+  ctx.save(); ctx.translate(0, base * 2 + 20); ctx.scale(1, -1); ctx.globalAlpha = .14; ctx.filter = 'blur(6px)'; ctx.drawImage(rcv, 0, 0); ctx.restore();
+  const fade = ctx.createLinearGradient(0, base, 0, base + 700);
+  fade.addColorStop(0, rgba(P.bg, 0)); fade.addColorStop(1, rgba(P.bg, 1));
+  ctx.fillStyle = fade; ctx.fillRect(0, base + 10, W, H - base);
+  vignette(ctx, P, .2);
+  grain(ctx, P.index * 11, .035);
+};
+
+// Layered sound wave ribbons, drawn like ink lines.
+MOTIFS['waveform'] = (ctx, P, r) => {
+  skyGradient(ctx, [[0, P.bg], [1, tint(P, 4, .08)]]);
+  const ribbons = [[P.c[6], P.c[4]], [P.c[5], P.c[1]], [P.c[3], P.c[2]]];
+  ctx.save(); ctx.globalCompositeOperation = 'multiply';
+  ribbons.forEach(([a, b], ri) => {
+    const f1 = .0012 + r() * .0008, f2 = .003 + r() * .002, ph = r() * 10, amp = 220 + r() * 160, yc = H * (.42 + ri * .08);
+    for (let k = 0; k < 42; k++) {
+      const t = k / 41, g = ctx.createLinearGradient(0, 0, W, 0);
+      g.addColorStop(0, rgba(a, 0)); g.addColorStop(.2, rgba(a, .4)); g.addColorStop(.8, rgba(b, .4)); g.addColorStop(1, rgba(b, 0));
+      ctx.strokeStyle = g; ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      for (let x = 0; x <= W; x += 8) {
+        const env = Math.sin(Math.PI * x / W);
+        const y = yc + env * (amp * Math.sin(x * f1 + ph + t * 1.2) + amp * .35 * Math.sin(x * f2 + ph * 2 - t * 2)) + (t - .5) * 90 * env;
+        x ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+      }
+      ctx.stroke();
+    }
+  });
+  ctx.restore();
+  vignette(ctx, P, .18);
+  grain(ctx, P.index * 19, .035);
+};
+
+// Pastel light spots with bokeh.
+MOTIFS['blobs'] = (ctx, P, r) => {
+  ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+  const sets = [[P.c[5], P.c[4], P.c[6]], [P.c[5], P.c[1], P.c[3]], [P.c[6], P.c[2], P.c[4]]];
+  const cols = sets[P.index % sets.length];
+  const spots = [[.22, .3], [.72, .38], [.48, .82], [.9, .9]];
+  ctx.save(); ctx.globalCompositeOperation = 'multiply';
+  spots.forEach(([u, v], i) => {
+    const x = W * (u + (r() - .5) * .12), y = H * (v + (r() - .5) * .12), rad = 900 + r() * 700;
+    const g = ctx.createRadialGradient(x, y, 0, x, y, rad);
+    const col = mix(cols[i % cols.length], P.bg, .45);
+    g.addColorStop(0, rgba(col, .85)); g.addColorStop(.5, rgba(col, .35)); g.addColorStop(1, rgba(col, 0));
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  });
+  ctx.restore();
+  const [bcv, bx] = layer();
+  for (let i = 0; i < 46; i++) {
+    const x = r() * W, y = r() * H, rad = 18 + Math.pow(r(), 2) * 110;
+    bx.fillStyle = rgba('#ffffff', .18 + r() * .2); bx.strokeStyle = rgba('#ffffff', .5);
+    bx.lineWidth = 3; bx.beginPath(); bx.arc(x, y, rad, 0, Math.PI * 2); bx.fill(); bx.stroke();
+  }
+  ctx.save(); ctx.filter = 'blur(3px)'; ctx.drawImage(bcv, 0, 0); ctx.restore();
+  vignette(ctx, P, .15);
+  grain(ctx, P.index * 23, .05);
+};
+
+// Sunlit shallow water with caustics.
+MOTIFS['depths'] = (ctx, P, r, noise) => {
+  skyGradient(ctx, [[0, tint(P, 6, .12)], [.5, tint(P, 6, .28)], [1, tint(P, 4, .45)]]);
+  // Caustic net: bright lines along the zero crossings of a noise field
+  const [ccv, cx] = layer(960, 540), img = cx.createImageData(960, 540);
+  for (let y = 0; y < 540; y++) for (let x = 0; x < 960; x++) {
+    const v = Math.abs(noise.fbm(x / 110 + 5, y / 70 + 9, 3));
+    const a = clamp(1 - v * 14, 0, 1) * (1 - y / 700);
+    const k = (y * 960 + x) * 4;
+    img.data[k] = img.data[k + 1] = img.data[k + 2] = 255; img.data[k + 3] = a * 170;
+  }
+  cx.putImageData(img, 0, 0);
+  ctx.save(); ctx.filter = 'blur(2px)'; ctx.drawImage(ccv, 0, 0, W, H); ctx.restore();
+  // Light rays
+  ctx.save(); ctx.filter = 'blur(16px)';
+  for (let i = 0; i < 18; i++) {
+    const x = W * (.05 + r() * .9), w = 30 + r() * 180, sk = 500 + r() * 400;
+    const g = ctx.createLinearGradient(0, 0, 0, H * .9);
+    g.addColorStop(0, rgba('#ffffff', .22 + r() * .2)); g.addColorStop(1, rgba('#ffffff', 0));
+    ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(x, -10); ctx.lineTo(x + w, -10); ctx.lineTo(x + w + sk + w, H * .9); ctx.lineTo(x + sk, H * .9); ctx.fill();
+  }
+  ctx.restore();
+  const floor = ridge(r, noise, H * .9, 200, .0016, 21);
+  fillRidge(ctx, floor, tint(P, 3, .35));
+  ctx.lineWidth = 3;
+  for (let i = 0; i < 40; i++) {
+    const x = r() * W, y = r() * H * .85, s = 6 + r() * 18;
+    ctx.strokeStyle = rgba('#ffffff', .7); ctx.beginPath(); ctx.arc(x, y, s, 0, Math.PI * 2); ctx.stroke();
+  }
+  for (let i = 0; i < 400; i++) {
+    ctx.fillStyle = rgba([P.c[6], P.c[4], P.c[2]][i % 3], .25 + r() * .3);
+    ctx.beginPath(); ctx.arc(r() * W, H * Math.pow(r(), .7), 1 + Math.pow(r(), 3) * 5, 0, Math.PI * 2); ctx.fill();
+  }
+  vignette(ctx, P, .18);
+  grain(ctx, P.index * 29, .035);
+};
+
+// Dunes at noon with drifting dust.
+MOTIFS['embers'] = (ctx, P, r, noise) => {
+  skyGradient(ctx, [[0, tint(P, 4, .12)], [.55, P.bg], [.8, tint(P, 3, .25)], [1, tint(P, 1, .3)]]);
+  const sun = ctx.createRadialGradient(W * .7, H * .25, 0, W * .7, H * .25, 700);
+  sun.addColorStop(0, rgba('#ffffff', .95)); sun.addColorStop(.12, rgba('#ffffff', .9)); sun.addColorStop(.13, rgba(tint(P, 3, .3), .6)); sun.addColorStop(1, rgba(P.bg, 0));
+  ctx.fillStyle = sun; ctx.fillRect(0, 0, W, H);
+  const dunes = [[H * .7, 220, .0008, 3, tint(P, 3, .3)], [H * .8, 240, .0011, 8, tint(P, 3, .48)], [H * .9, 200, .0015, 13, tint(P, 1, .45)]];
+  dunes.forEach(([base, amp, freq, seed, col]) => {
+    const d = ridge(r, noise, base, amp, freq, seed);
+    fillRidge(ctx, d, col);
+    strokeRidge(ctx, d, rgba('#ffffff', .6), 3);
+  });
+  ctx.lineCap = 'round';
+  for (let i = 0; i < 900; i++) {
+    const x = r() * W, y = H * Math.pow(r(), .6), s = Math.pow(r(), 2.5) * 4 + 1;
+    ctx.strokeStyle = rgba([P.c[3], P.c[1], P.c[11]][Math.floor(r() * 3)], .25 + r() * .35); ctx.lineWidth = s;
+    const len = 6 + r() * 40;
+    ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + len, y - len * .2); ctx.stroke();
+  }
+  vignette(ctx, P, .18);
+  grain(ctx, P.index * 37, .04);
+};
+
+// A pixel art landscape at noon.
+MOTIFS['pixels'] = (ctx, P, r, noise) => {
+  const cell = 40, cols = W / cell, rows = Math.ceil(H / cell);
+  const sky = [tint(P, 4, .4), tint(P, 4, .28), tint(P, 6, .18), tint(P, 6, .08), P.bg];
+  const bayer = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+  const hz = Math.floor(rows * .68);
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    const t = clamp(y / hz, 0, 1) * (sky.length - 1), i = Math.floor(t), f = t - i;
+    const pick = f > (bayer[y % 4][x % 4] + .5) / 16 ? Math.min(i + 1, sky.length - 1) : i;
+    ctx.fillStyle = sky[pick]; ctx.fillRect(x * cell, y * cell, cell, cell);
+  }
+  // Pixel sun
+  const mx = Math.floor(cols * .74), my = Math.floor(rows * .2), mr = 5;
+  for (let y = -mr; y <= mr; y++) for (let x = -mr; x <= mr; x++) if (x * x + y * y <= mr * mr + 2) { ctx.fillStyle = x + y > 3 ? tint(P, 3, .75) : tint(P, 3, .4); ctx.fillRect((mx + x) * cell, (my + y) * cell, cell, cell); }
+  // Pixel clouds
+  for (let c = 0; c < 6; c++) {
+    const cx0 = Math.floor(r() * cols), cy0 = Math.floor(2 + r() * hz * .45), w = 5 + Math.floor(r() * 7);
+    ctx.fillStyle = '#ffffff';
+    for (let k = 0; k < w; k++) ctx.fillRect((cx0 + k) * cell, cy0 * cell, cell, cell);
+    for (let k = 1; k < w - 1; k++) if (r() < .7) ctx.fillRect((cx0 + k) * cell, (cy0 - 1) * cell, cell, cell);
+  }
+  const layersM = [[tint(P, 4, .35), .3, 7], [tint(P, 4, .55), .18, 13], [tint(P, 2, .6), .1, 29]];
+  layersM.forEach(([col, amp, seed]) => {
+    for (let x = 0; x < cols; x++) {
+      const h = Math.floor(hz - Math.abs(noise.fbm(x * .035 + seed, seed, 3)) * rows * amp * 2.2 - rows * .04);
+      ctx.fillStyle = col; ctx.fillRect(x * cell, h * cell, cell, H);
+      ctx.fillStyle = rgba('#ffffff', .35); ctx.fillRect(x * cell, h * cell, cell, cell / 4);
+    }
+  });
+  for (let y = hz; y < rows; y++) for (let x = 0; x < cols; x++) {
+    ctx.fillStyle = (x + y) % 2 ? tint(P, 2, .28) : tint(P, 2, .38); ctx.fillRect(x * cell, y * cell, cell, cell);
+  }
+  ctx.fillStyle = P.c[6]; ctx.fillRect(0, hz * cell - 4, W, 8);
+  ctx.fillStyle = rgba(P.fg, .06);
+  for (let x = 0; x < W; x += cell) ctx.fillRect(x, 0, 2, H);
+  for (let y = 0; y < H; y += cell) ctx.fillRect(0, y, W, 2);
+  vignette(ctx, P, .15);
+};
+
+// A faded VHS still with tracking noise.
+MOTIFS['scanlines'] = (ctx, P, r, noise) => {
+  skyGradient(ctx, [[0, P.bg], [1, tint(P, 4, .1)]]);
+  cloudField(ctx, P, noise, [tint(P, 4, .4), tint(P, 5, .4), tint(P, 6, .4)], { alpha: .45, band: .5, tilt: -.2 });
+  ctx.save(); ctx.globalCompositeOperation = 'multiply';
+  for (let i = 0; i < 16; i++) {
+    const y = r() * H, h = 8 + r() * 90, x = r() * W * .6, w = W * (.2 + r() * .6), off = 16 + r() * 36;
+    ctx.fillStyle = rgba(P.c[1], .25); ctx.fillRect(x - off, y, w, h);
+    ctx.fillStyle = rgba(P.c[6], .25); ctx.fillRect(x + off, y, w, h);
+  }
+  ctx.restore();
+  const ty = H * (.25 + r() * .5);
+  for (let i = 0; i < 4000; i++) { ctx.fillStyle = rgba(P.fg, r() * .25); ctx.fillRect(r() * W, ty + r() * 120, 2 + r() * 14, 2); }
+  ctx.font = `bold 84px ${MONO}`; ctx.fillStyle = P.fg; ctx.textBaseline = 'top';
+  ctx.fillText('PLAY ▶', 200, 170);
+  ctx.fillText(`SP  0${P.index % 10}:${String(P.index * 7 % 60).padStart(2, '0')}:${String(P.index * 13 % 60).padStart(2, '0')}`, 200, H - 280);
+  ctx.textAlign = 'right'; ctx.fillText(P.base.toUpperCase(), W - 200, 170); ctx.textAlign = 'left';
+  ctx.fillStyle = rgba(P.fg, .05);
+  for (let y = 0; y < H; y += 8) ctx.fillRect(0, y, W, 3);
+  vignette(ctx, P, .35);
+  grain(ctx, P.index * 41, .07);
+};
+
+// A topographic map on paper.
+MOTIFS['contours'] = (ctx, P, r, noise) => {
+  ctx.fillStyle = P.bg; ctx.fillRect(0, 0, W, H);
+  const step = 10, gw = Math.ceil(W / step) + 1, gh = Math.ceil(H / step) + 1, f = new Float32Array(gw * gh);
+  for (let y = 0; y < gh; y++) for (let x = 0; x < gw; x++) f[y * gw + x] = noise.fbm(x * step / 1400 + 3, y * step / 1400 + 7, 5);
+  // Elevation tint under the lines
+  const [tcv, tx] = layer(gw, gh), timg = tx.createImageData(gw, gh);
+  const low = rgb(tint(P, 2, .16)), high = rgb(tint(P, 3, .22));
+  for (let i = 0; i < gw * gh; i++) {
+    const t = clamp(f[i] + .5, 0, 1);
+    timg.data[i * 4] = lerp(low[0], high[0], t); timg.data[i * 4 + 1] = lerp(low[1], high[1], t); timg.data[i * 4 + 2] = lerp(low[2], high[2], t); timg.data[i * 4 + 3] = 255;
+  }
+  tx.putImageData(timg, 0, 0);
+  ctx.save(); ctx.imageSmoothingQuality = 'high'; ctx.drawImage(tcv, 0, 0, W, H); ctx.restore();
+  const levels = 22, lo = -.55, hi = .55;
+  const cols = [P.c[4], P.c[6], P.c[2], P.c[3], P.c[1]];
+  for (let li = 0; li < levels; li++) {
+    const iso = lo + (hi - lo) * li / (levels - 1), accent = li % 5 === 0;
+    const t = li / (levels - 1) * (cols.length - 1), i0 = Math.floor(t);
+    ctx.strokeStyle = rgba(mix(cols[i0], cols[Math.min(i0 + 1, cols.length - 1)], t - i0), accent ? .9 : .45);
+    ctx.lineWidth = accent ? 3.5 : 2;
+    ctx.beginPath();
+    for (let y = 0; y < gh - 1; y++) for (let x = 0; x < gw - 1; x++) {
+      const a = f[y * gw + x], b = f[y * gw + x + 1], c = f[(y + 1) * gw + x + 1], d = f[(y + 1) * gw + x];
+      const idx = (a > iso) | (b > iso) << 1 | (c > iso) << 2 | (d > iso) << 3;
+      if (idx === 0 || idx === 15) continue;
+      const px = x * step, py = y * step;
+      const e = [[px + step * (iso - a) / (b - a), py], [px + step, py + step * (iso - b) / (c - b)], [px + step * (iso - d) / (c - d), py + step], [px, py + step * (iso - a) / (d - a)]];
+      const seg = { 1: [[3, 0]], 2: [[0, 1]], 3: [[3, 1]], 4: [[1, 2]], 5: [[3, 0], [1, 2]], 6: [[0, 2]], 7: [[3, 2]], 8: [[2, 3]], 9: [[0, 2]], 10: [[0, 1], [2, 3]], 11: [[1, 2]], 12: [[1, 3]], 13: [[0, 1]], 14: [[0, 3]] }[idx];
+      seg.forEach(([s, t2]) => { ctx.moveTo(e[s][0], e[s][1]); ctx.lineTo(e[t2][0], e[t2][1]); });
+    }
+    ctx.stroke();
+  }
+  for (let i = 0; i < 9; i++) {
+    const x = W * (.1 + r() * .8), y = H * (.1 + r() * .8);
+    ctx.fillStyle = P.accent; ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = rgba(P.accent, .8); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x, y, 30, 0, Math.PI * 2); ctx.stroke();
+  }
+  vignette(ctx, P, .2);
+  grain(ctx, P.index * 43, .03);
+};
+
+// Unlit neon tubes on a plaster wall in daylight.
+MOTIFS['tubes'] = (ctx, P) => {
+  skyGradient(ctx, [[0, P.bg], [1, tint(P, 8, .25)]]);
+  ctx.strokeStyle = rgba(P.c[8], .35); ctx.lineWidth = 2;
+  for (let y = 0, row = 0; y < H; y += 64, row++) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    for (let x = (row % 2) * -80; x < W; x += 160) { ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x, y + 64); ctx.stroke(); }
+  }
+  const cx = W / 2, cy = H * .45;
+  const shapes = [
+    lx => { lx.strokeStyle = P.c[6]; lx.lineWidth = 22; lx.beginPath(); lx.arc(cx - 260, cy, 360, 0, Math.PI * 2); lx.stroke(); },
+    lx => { lx.strokeStyle = P.c[5]; lx.lineWidth = 22; lx.beginPath(); lx.moveTo(cx + 260, cy - 420); lx.lineTo(cx + 660, cy + 300); lx.lineTo(cx - 140, cy + 300); lx.closePath(); lx.stroke(); },
+    lx => { lx.strokeStyle = P.c[3]; lx.lineWidth = 14; lx.beginPath(); for (let i = 0; i < 9; i++) lx.lineTo(cx - 1100 + i * 110, cy + 380 + (i % 2 ? -60 : 60)); lx.stroke(); },
+    lx => { lx.strokeStyle = P.c[1]; lx.lineWidth = 14; lx.beginPath(); lx.roundRect(cx + 800, cy - 420, 260, 260, 40); lx.stroke(); },
+    lx => { lx.fillStyle = P.c[2]; for (let i = 0; i < 5; i++) { lx.beginPath(); lx.arc(cx - 1250 + i * 70, cy - 380, 16, 0, Math.PI * 2); lx.fill(); } },
+  ];
+  const draw = lx => { lx.lineCap = 'round'; lx.lineJoin = 'round'; shapes.forEach(s => s(lx)); };
+  dropShadow(ctx, draw, 18, 26, 22, .28, P.fg);
+  // Glass highlight along each tube
+  const [hcv, hx] = layer(); draw(hx);
+  hx.globalCompositeOperation = 'source-in'; hx.fillStyle = rgba('#ffffff', .45); hx.fillRect(0, 0, W, H);
+  ctx.save(); ctx.translate(-4, -5); ctx.scale(1, 1); ctx.globalAlpha = .6; ctx.filter = 'blur(2px)'; ctx.drawImage(hcv, 0, 0); ctx.restore();
+  vignette(ctx, P, .2);
+  grain(ctx, P.index * 47, .045);
+};
+
+// A pale planet in the day sky, or an eclipse for Black Hole Day.
+MOTIFS['planet'] = (ctx, P, r, noise) => {
+  skyGradient(ctx, [[0, tint(P, 4, .2)], [1, P.bg]]);
+  cloudField(ctx, P, noise, ['#ffffff', tint(P, 4, .05)], { alpha: .6, band: .4, tilt: .4, comp: 'source-over' });
+  const cx = W * .5, cy = H * .5;
+  if (P.slug.startsWith('black-hole')) {
+    const corona = ctx.createRadialGradient(cx, cy, 420, cx, cy, 1300);
+    corona.addColorStop(0, rgba(P.c[3], .9)); corona.addColorStop(.08, rgba(tint(P, 3, .6), .7)); corona.addColorStop(.4, rgba(tint(P, 1, .3), .25)); corona.addColorStop(1, rgba(P.bg, 0));
+    ctx.fillStyle = corona; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = P.fg; ctx.beginPath(); ctx.arc(cx, cy, 440, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = rgba('#ffffff', .9); ctx.lineWidth = 6; ctx.beginPath(); ctx.arc(cx, cy, 446, 0, Math.PI * 2); ctx.stroke();
+  } else {
+    const pr = 820, px = W * .62, py = H * .62;
+    const [pcv, pc] = layer();
+    pc.save(); pc.beginPath(); pc.arc(px, py, pr, 0, Math.PI * 2); pc.clip();
+    for (let y = py - pr; y < py + pr; y += 4) {
+      const v = noise.fbm(3, y * .004, 4) + noise(y * .02, 5) * .3;
+      pc.fillStyle = mix(tint(P, 1, .55), tint(P, 3, .55), clamp(v + .5, 0, 1));
+      pc.fillRect(px - pr, y, pr * 2, 4);
+    }
+    pc.filter = 'blur(6px)'; pc.drawImage(pcv, 0, 0); pc.filter = 'none';
+    const shade = pc.createRadialGradient(px - pr * .45, py - pr * .45, pr * .1, px, py, pr * 1.05);
+    shade.addColorStop(0, rgba('#ffffff', .25)); shade.addColorStop(.7, rgba(P.bg, 0)); shade.addColorStop(1, rgba(P.c[4], .35));
+    pc.fillStyle = shade; pc.fillRect(0, 0, W, H);
+    pc.restore();
+    halo(ctx, lx => lx.drawImage(pcv, 0, 0), [80], [.25]);
+  }
+  vignette(ctx, P, .18);
+  grain(ctx, P.index * 53, .035);
+};
+
+// ---------- entry point ----------
+
+window.renderImage = async (theme, kind, width, height, mime = 'image/png', quality = .92) => {
+  await document.fonts.load(`40px ${MONO}`);
+  const cv = document.getElementById('c');
+  cv.width = width; cv.height = height;
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(width / W, 0, 0, height / H, 0, 0);
+  const P = { ...theme, bg: theme.colors.background, fg: theme.colors.foreground, darker: theme.colors.darker_background, accent: theme.colors.accent, c: theme.ansi, base: theme.base || theme.name };
+  const r = rng(theme.index * 104729 + (kind === 'wordmark' ? 1 : 2));
+  const noise = makeNoise(theme.index * 7907 + 3);
+  if (kind === 'wordmark') wordmark(ctx, P, r);
+  else MOTIFS[theme.motif](ctx, P, r, noise);
+  return cv.toDataURL(mime, quality);
+};
+</script>
+</body>
+</html>
