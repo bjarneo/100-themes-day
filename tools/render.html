@@ -10,10 +10,13 @@
 <script>
 // Background renderer. tools/render.mjs loads this page in headless Chromium
 // and calls window.renderImage(). All drawing uses a 3840x2160 design space.
+// S scales the design space to the output size. Full-size layers use the
+// output resolution, and blur radii scale with S, so every size looks the same.
 
 const W = 3840, H = 2160;
 const MONO = '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace';
 let LOGO = [];
+let S = 1;
 
 window.setLogo = paths => { LOGO = paths.map(p => ({ path: new Path2D(p.d), rule: p.evenodd ? 'evenodd' : 'nonzero' })); };
 
@@ -38,11 +41,20 @@ function lerp(a, b, t) { return a + (b - a) * t; }
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function smooth(t) { return t * t * (3 - 2 * t); }
 
-function layer(w = W, h = H) {
+// A layer without a size covers the design space at the output resolution.
+// Draw it back with drawImage(cv, 0, 0, W, H). A layer with a size is a
+// small helper bitmap at that exact pixel size.
+function layer(w, h) {
   const cv = document.createElement('canvas');
-  cv.width = w; cv.height = h;
-  return [cv, cv.getContext('2d')];
+  const full = w === undefined;
+  cv.width = full ? Math.round(W * S) : w; cv.height = full ? Math.round(H * S) : h;
+  const cx = cv.getContext('2d');
+  if (full) cx.setTransform(S, 0, 0, S, 0, 0);
+  return [cv, cx];
 }
+
+// Canvas blur ignores the transform, so the radius scales with S.
+const blur = r => `blur(${(r * S).toFixed(1)}px)`;
 
 // Seeded 2D gradient noise.
 function makeNoise(seed) {
@@ -69,10 +81,10 @@ function bloom(ctx, draw, radii = [90, 28], strength = [.85, .9]) {
   draw(lx);
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';
-  radii.forEach((r, i) => { ctx.filter = `blur(${r}px)`; ctx.globalAlpha = strength[i]; ctx.drawImage(cv, 0, 0); });
+  radii.forEach((r, i) => { ctx.filter = blur(r); ctx.globalAlpha = strength[i]; ctx.drawImage(cv, 0, 0, W, H); });
   ctx.filter = 'none'; ctx.globalAlpha = 1;
   ctx.globalCompositeOperation = 'source-over';
-  ctx.drawImage(cv, 0, 0);
+  ctx.drawImage(cv, 0, 0, W, H);
   ctx.restore();
 }
 
@@ -89,20 +101,20 @@ function halo(ctx, draw, radii = [70, 20], strength = [.35, .3]) {
   const [cv, lx] = layer();
   draw(lx);
   ctx.save();
-  radii.forEach((r, i) => { ctx.filter = `blur(${r}px)`; ctx.globalAlpha = strength[i]; ctx.drawImage(cv, 0, 0); });
+  radii.forEach((r, i) => { ctx.filter = blur(r); ctx.globalAlpha = strength[i]; ctx.drawImage(cv, 0, 0, W, H); });
   ctx.restore();
-  ctx.drawImage(cv, 0, 0);
+  ctx.drawImage(cv, 0, 0, W, H);
 }
 
 // A soft shadow under a layer, as if the light comes from the top left.
-function dropShadow(ctx, draw, dx = 14, dy = 20, blur = 26, alpha = .22, color = '#000000') {
+function dropShadow(ctx, draw, dx = 14, dy = 20, radius = 26, alpha = .22, color = '#000000') {
   const [cv, lx] = layer();
   draw(lx);
   const [sv, sx] = layer();
-  sx.drawImage(cv, 0, 0);
+  sx.drawImage(cv, 0, 0, W, H);
   sx.globalCompositeOperation = 'source-in'; sx.fillStyle = color; sx.fillRect(0, 0, W, H);
-  ctx.save(); ctx.filter = `blur(${blur}px)`; ctx.globalAlpha = alpha; ctx.drawImage(sv, dx, dy); ctx.restore();
-  ctx.drawImage(cv, 0, 0);
+  ctx.save(); ctx.filter = blur(radius); ctx.globalAlpha = alpha; ctx.drawImage(sv, dx, dy, W, H); ctx.restore();
+  ctx.drawImage(cv, 0, 0, W, H);
 }
 
 const tint = (P, k, t) => mix(P.bg, P.c[k], t);
@@ -114,7 +126,9 @@ function grain(ctx, seed, alpha = .05) {
   gx.putImageData(img, 0, 0);
   ctx.save();
   ctx.globalAlpha = alpha; ctx.globalCompositeOperation = 'overlay';
-  ctx.fillStyle = ctx.createPattern(cv, 'repeat'); ctx.fillRect(0, 0, W, H);
+  const pattern = ctx.createPattern(cv, 'repeat');
+  pattern.setTransform(new DOMMatrix().scale(1 / S));
+  ctx.fillStyle = pattern; ctx.fillRect(0, 0, W, H);
   ctx.restore();
 }
 
@@ -183,7 +197,7 @@ function wordmark(ctx, P, r) {
   const mask = rx.createLinearGradient(0, ly + lh + 40, 0, ly + lh + 40 + lh * .8);
   mask.addColorStop(0, 'rgba(0,0,0,.14)'); mask.addColorStop(1, 'rgba(0,0,0,0)');
   rx.globalCompositeOperation = 'destination-in'; rx.fillStyle = mask; rx.fillRect(0, 0, W, H);
-  ctx.save(); ctx.filter = 'blur(4px)'; ctx.drawImage(rcv, 0, 0); ctx.restore();
+  ctx.save(); ctx.filter = blur(4); ctx.drawImage(rcv, 0, 0, W, H); ctx.restore();
 
   halo(ctx, lx2 => drawLogo(lx2, lx, ly, scale, grad), [110, 30], [.28, .22]);
 
@@ -220,8 +234,8 @@ function cloudField(ctx, P, noise, colors, opts = {}) {
   }
   cx.putImageData(img, 0, 0);
   ctx.save(); ctx.imageSmoothingQuality = 'high'; ctx.globalCompositeOperation = opts.comp || 'multiply';
-  ctx.filter = 'blur(18px)'; ctx.drawImage(cv, 0, 0, W, H);
-  ctx.filter = 'blur(3px)'; ctx.globalAlpha = .5; ctx.drawImage(cv, 0, 0, W, H);
+  ctx.filter = blur(18); ctx.drawImage(cv, 0, 0, W, H);
+  ctx.filter = blur(3); ctx.globalAlpha = .5; ctx.drawImage(cv, 0, 0, W, H);
   ctx.restore();
 }
 
@@ -238,8 +252,8 @@ MOTIFS['sunset-grid'] = (ctx, P, r, noise) => {
   for (let i = 0; i < 9; i++) { const y = scy + 30 + i * i * 7 + i * 34, h = 6 + i * 4.2; sx.fillRect(0, y, W, h); }
   sx.globalCompositeOperation = 'source-over';
   sx.clearRect(0, hz, W, H);
-  ctx.save(); ctx.filter = 'blur(120px)'; ctx.globalAlpha = .35; ctx.drawImage(scv, 0, 0); ctx.restore();
-  ctx.drawImage(scv, 0, 0);
+  ctx.save(); ctx.filter = blur(120); ctx.globalAlpha = .35; ctx.drawImage(scv, 0, 0, W, H); ctx.restore();
+  ctx.drawImage(scv, 0, 0, W, H);
 
   const far = ridge(r, noise, hz, 360, .0011, 3);
   fillRidge(ctx, far, tint(P, 4, .3));
@@ -330,14 +344,14 @@ MOTIFS['aurora'] = (ctx, P, r, noise) => {
       ax.fillStyle = g; ax.fillRect(x, y - len, 4, len);
     }
   });
-  ctx.save(); ctx.filter = 'blur(8px)'; ctx.globalCompositeOperation = 'multiply'; ctx.drawImage(acv, 0, 0); ctx.restore();
+  ctx.save(); ctx.filter = blur(8); ctx.globalCompositeOperation = 'multiply'; ctx.drawImage(acv, 0, 0, W, H); ctx.restore();
   ctx.save();
   ctx.beginPath(); ctx.rect(0, hz, W, H - hz); ctx.clip();
   const lake = ctx.createLinearGradient(0, hz, 0, H);
   lake.addColorStop(0, tint(P, 6, .08)); lake.addColorStop(1, tint(P, 4, .22));
   ctx.fillStyle = lake; ctx.fillRect(0, hz, W, H - hz);
-  ctx.translate(0, hz * 2); ctx.scale(1, -1); ctx.globalAlpha = .45; ctx.filter = 'blur(14px)'; ctx.globalCompositeOperation = 'multiply';
-  ctx.drawImage(acv, 0, 0);
+  ctx.translate(0, hz * 2); ctx.scale(1, -1); ctx.globalAlpha = .45; ctx.filter = blur(14); ctx.globalCompositeOperation = 'multiply';
+  ctx.drawImage(acv, 0, 0, W, H);
   ctx.restore();
   // Mountains on their own layer, cut at the shore line, with a mirror image in the lake
   const [mcv, mx] = layer();
@@ -347,8 +361,8 @@ MOTIFS['aurora'] = (ctx, P, r, noise) => {
   const near = ridge(r, noise, hz + 2, 200, .003, 17);
   fillRidge(mx, near, tint(P, 4, .5));
   mx.clearRect(0, hz + 2, W, H);
-  ctx.drawImage(mcv, 0, 0);
-  ctx.save(); ctx.translate(0, (hz + 2) * 2); ctx.scale(1, -1); ctx.globalAlpha = .35; ctx.filter = 'blur(5px)'; ctx.drawImage(mcv, 0, 0); ctx.restore();
+  ctx.drawImage(mcv, 0, 0, W, H);
+  ctx.save(); ctx.translate(0, (hz + 2) * 2); ctx.scale(1, -1); ctx.globalAlpha = .35; ctx.filter = blur(5); ctx.drawImage(mcv, 0, 0, W, H); ctx.restore();
   ctx.fillStyle = rgba('#ffffff', .5);
   for (let i = 0; i < 60; i++) ctx.fillRect(r() * W, hz + 20 + Math.pow(r(), 1.5) * (H - hz), 40 + r() * 160, 2);
   ctx.fillStyle = rgba('#ffffff', .6); ctx.fillRect(0, hz + 8, W, 2);
@@ -383,7 +397,7 @@ MOTIFS['skyline'] = (ctx, P, r, noise) => {
       x += bw + 6 + r() * 30;
     }
   });
-  ctx.drawImage(ccv, 0, 0);
+  ctx.drawImage(ccv, 0, 0, W, H);
   dropShadow(ctx, lx => {
     signs.forEach(n => {
       lx.strokeStyle = n.color; lx.lineWidth = 7;
@@ -394,8 +408,8 @@ MOTIFS['skyline'] = (ctx, P, r, noise) => {
   ctx.save();
   ctx.beginPath(); ctx.rect(0, street, W, H - street); ctx.clip();
   ctx.fillStyle = tint(P, 4, .12); ctx.fillRect(0, street, W, H - street);
-  ctx.translate(0, street * 2); ctx.scale(1, -1); ctx.globalAlpha = .25; ctx.filter = 'blur(8px)';
-  ctx.drawImage(ccv, 0, 0);
+  ctx.translate(0, street * 2); ctx.scale(1, -1); ctx.globalAlpha = .25; ctx.filter = blur(8);
+  ctx.drawImage(ccv, 0, 0, W, H);
   ctx.restore();
   vignette(ctx, P, .18);
   grain(ctx, P.index * 3, .035);
@@ -423,7 +437,7 @@ MOTIFS['equalizer'] = (ctx, P, r, noise) => {
   };
   halo(ctx, drawBars, [50, 14], [.25, .2]);
   const [rcv, rx] = layer(); drawBars(rx);
-  ctx.save(); ctx.translate(0, base * 2 + 20); ctx.scale(1, -1); ctx.globalAlpha = .14; ctx.filter = 'blur(6px)'; ctx.drawImage(rcv, 0, 0); ctx.restore();
+  ctx.save(); ctx.translate(0, base * 2 + 20); ctx.scale(1, -1); ctx.globalAlpha = .14; ctx.filter = blur(6); ctx.drawImage(rcv, 0, 0, W, H); ctx.restore();
   const fade = ctx.createLinearGradient(0, base, 0, base + 700);
   fade.addColorStop(0, rgba(P.bg, 0)); fade.addColorStop(1, rgba(P.bg, 1));
   ctx.fillStyle = fade; ctx.fillRect(0, base + 10, W, H - base);
@@ -477,7 +491,7 @@ MOTIFS['blobs'] = (ctx, P, r) => {
     bx.fillStyle = rgba('#ffffff', .18 + r() * .2); bx.strokeStyle = rgba('#ffffff', .5);
     bx.lineWidth = 3; bx.beginPath(); bx.arc(x, y, rad, 0, Math.PI * 2); bx.fill(); bx.stroke();
   }
-  ctx.save(); ctx.filter = 'blur(3px)'; ctx.drawImage(bcv, 0, 0); ctx.restore();
+  ctx.save(); ctx.filter = blur(3); ctx.drawImage(bcv, 0, 0, W, H); ctx.restore();
   vignette(ctx, P, .15);
   grain(ctx, P.index * 23, .05);
 };
@@ -494,9 +508,9 @@ MOTIFS['depths'] = (ctx, P, r, noise) => {
     img.data[k] = img.data[k + 1] = img.data[k + 2] = 255; img.data[k + 3] = a * 170;
   }
   cx.putImageData(img, 0, 0);
-  ctx.save(); ctx.filter = 'blur(2px)'; ctx.drawImage(ccv, 0, 0, W, H); ctx.restore();
+  ctx.save(); ctx.filter = blur(2); ctx.drawImage(ccv, 0, 0, W, H); ctx.restore();
   // Light rays
-  ctx.save(); ctx.filter = 'blur(16px)';
+  ctx.save(); ctx.filter = blur(16);
   for (let i = 0; i < 18; i++) {
     const x = W * (.05 + r() * .9), w = 30 + r() * 180, sk = 500 + r() * 400;
     const g = ctx.createLinearGradient(0, 0, 0, H * .9);
@@ -667,7 +681,7 @@ MOTIFS['tubes'] = (ctx, P) => {
   // Glass highlight along each tube
   const [hcv, hx] = layer(); draw(hx);
   hx.globalCompositeOperation = 'source-in'; hx.fillStyle = rgba('#ffffff', .45); hx.fillRect(0, 0, W, H);
-  ctx.save(); ctx.translate(-4, -5); ctx.scale(1, 1); ctx.globalAlpha = .6; ctx.filter = 'blur(2px)'; ctx.drawImage(hcv, 0, 0); ctx.restore();
+  ctx.save(); ctx.translate(-4, -5); ctx.scale(1, 1); ctx.globalAlpha = .6; ctx.filter = blur(2); ctx.drawImage(hcv, 0, 0, W, H); ctx.restore();
   vignette(ctx, P, .2);
   grain(ctx, P.index * 47, .045);
 };
@@ -692,12 +706,12 @@ MOTIFS['planet'] = (ctx, P, r, noise) => {
       pc.fillStyle = mix(tint(P, 1, .55), tint(P, 3, .55), clamp(v + .5, 0, 1));
       pc.fillRect(px - pr, y, pr * 2, 4);
     }
-    pc.filter = 'blur(6px)'; pc.drawImage(pcv, 0, 0); pc.filter = 'none';
+    pc.filter = blur(6); pc.drawImage(pcv, 0, 0, W, H); pc.filter = 'none';
     const shade = pc.createRadialGradient(px - pr * .45, py - pr * .45, pr * .1, px, py, pr * 1.05);
     shade.addColorStop(0, rgba('#ffffff', .25)); shade.addColorStop(.7, rgba(P.bg, 0)); shade.addColorStop(1, rgba(P.c[4], .35));
     pc.fillStyle = shade; pc.fillRect(0, 0, W, H);
     pc.restore();
-    halo(ctx, lx => lx.drawImage(pcv, 0, 0), [80], [.25]);
+    halo(ctx, lx => lx.drawImage(pcv, 0, 0, W, H), [80], [.25]);
   }
   vignette(ctx, P, .18);
   grain(ctx, P.index * 53, .035);
@@ -710,7 +724,8 @@ window.renderImage = async (theme, kind, width, height, mime = 'image/png', qual
   const cv = document.getElementById('c');
   cv.width = width; cv.height = height;
   const ctx = cv.getContext('2d');
-  ctx.setTransform(width / W, 0, 0, height / H, 0, 0);
+  S = width / W;
+  ctx.setTransform(S, 0, 0, S, 0, 0);
   const P = { ...theme, bg: theme.colors.background, fg: theme.colors.foreground, darker: theme.colors.darker_background, accent: theme.colors.accent, c: theme.ansi, base: theme.base || theme.name };
   const r = rng(theme.index * 104729 + (kind === 'wordmark' ? 1 : 2));
   const noise = makeNoise(theme.index * 7907 + 3);

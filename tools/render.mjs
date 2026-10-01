@@ -4,6 +4,7 @@
 //   node tools/render.mjs synthwave hacker render the named themes
 //   PREVIEW=1 OUT=/tmp/x node tools/render.mjs synthwave
 //                                          write small JPEGs to $OUT
+//   SIZE=3840x2160 node tools/render.mjs   render at another 16:9 size
 //
 // Needs `chromium` and `magick` on PATH.
 
@@ -20,6 +21,8 @@ const PREVIEW = !!process.env.PREVIEW;
 const OUT = process.env.OUT || ROOT;
 const WORKERS = Number(process.env.WORKERS || 4);
 const LOGO_SVG = process.env.LOGO_SVG || '/usr/share/omarchy/logo.svg';
+// Output size of the backgrounds. 6144x3456 is 6K at 16:9.
+const SIZE = (process.env.SIZE || '6144x3456').split('x').map(Number);
 
 const wanted = process.argv.slice(2);
 const list = wanted.length ? themes.filter(t => wanted.includes(t.slug)) : themes;
@@ -36,7 +39,7 @@ function backgroundPaths(t) {
 }
 
 async function renderOne(page, t, kind, file) {
-  const [w, h] = PREVIEW ? [960, 540] : [3840, 2160];
+  const [w, h] = PREVIEW ? [960, 540] : SIZE;
   const url = await page.evaluate(`renderImage(${JSON.stringify(t)}, ${JSON.stringify(kind)}, ${w}, ${h})`);
   const png = join(scratch, `${t.slug}-${kind}.png`);
   writeFileSync(png, Buffer.from(url.split(',')[1], 'base64'));

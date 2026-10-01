@@ -37,7 +37,7 @@ cd ~/.local/share/100-themes-day
 omarchy theme set synthwave-day
 ```
 
-The full repo is about 170 MB because it has 200 backgrounds at 3840×2160.
+The full repo is about 290 MB because it has 200 backgrounds at 6K, 6144×3456.
 
 ### Apply with Aether
 
@@ -148,7 +148,7 @@ Against the background, yellow has a contrast ratio of at least 2.7:1, with a me
 
 ## Backgrounds
 
-Each theme has 2 backgrounds at 3840×2160. The important content stays near the center, so the images also fill 16:10 and 21:9 screens.
+Each theme has 2 backgrounds at 6K, 6144×3456. The important content stays near the center, so the images also fill 16:10 and 21:9 screens.
 
 - `0-omarchy-wordmark.jpg` shows the Omarchy wordmark with a cyan to magenta gradient from the palette. The 6 normal and 6 bright ANSI colors are below it.
 - `1-<motif>.jpg` is drawn only with colors from the palette. Each motif is the day version of the night motif.
@@ -178,7 +178,7 @@ The `tools/` folder has every script that made this repo. You need Node.js 22 or
 | Command | Result |
 | --- | --- |
 | `node tools/build.mjs` | Writes `colors.toml`, `icons.theme` and `assets/themes.js` |
-| `node tools/render.mjs [theme...]` | Renders the backgrounds with headless Chromium |
+| `node tools/render.mjs [theme...]` | Renders the backgrounds at 6144×3456 with headless Chromium. Set `SIZE=3840x2160` for another 16:9 size. |
 | `tools/capture.sh [theme...]` | Applies each theme, takes a screenshot of workspace 7, and writes `preview.png` |
 | `node tools/promo.mjs <song.mp3>` | Renders `assets/promo.mp4` with one theme per beat |
 | `node tools/readme.mjs` | Writes this README |
