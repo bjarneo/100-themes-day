@@ -351,9 +351,9 @@ const pad = n => String(n).padStart(3, '0');
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 let motif = 'all', current = -1, view = 'shot';
 
-function toast(msg) {
+function toast(msg, ms = 1200) {
   const el = $('toast'); el.textContent = msg; el.classList.add('show');
-  clearTimeout(toast.t); toast.t = setTimeout(() => el.classList.remove('show'), 1200);
+  clearTimeout(toast.t); toast.t = setTimeout(() => el.classList.remove('show'), ms);
 }
 function copy(text, msg = 'Copied') {
   navigator.clipboard?.writeText(text).then(() => toast(msg), () => toast('Copy failed'));
@@ -400,18 +400,21 @@ render();
 function imageFor(t) {
   return { shot: `${t.slug}/preview.png`, wordmark: `${t.slug}/backgrounds/0-omarchy-wordmark.jpg`, native: `${t.slug}/backgrounds/1-${t.motif}.jpg` }[view];
 }
-// aether:// links. Aether downloads the files from this site over HTTPS.
+// aether:// links, built like the links on the omarchy-themes site. Aether
+// downloads the files from this site over HTTPS and stops a download after
+// 60 seconds, so the links use the 3840x2160 copies in assets/aether.
+// silent=true applies without the Aether window.
 function aetherUrl(t, extra = {}) {
   const bg = view === 'wordmark' ? '0-omarchy-wordmark.jpg' : `1-${t.motif}.jpg`;
-  const q = new URLSearchParams({ colors: `${SITE}/${t.slug}/colors.toml`, wallpaper: `${SITE}/${t.slug}/backgrounds/${bg}`, ...extra });
+  const q = new URLSearchParams({ colors: `${SITE}/${t.slug}/colors.toml`, wallpaper: `${SITE}/assets/aether/${t.slug}/${bg}`, ...extra });
   return `aether://apply?${q}`;
 }
 function updateAether(t) {
-  $('a-apply').href = aetherUrl(t);
-  $('a-install').href = aetherUrl(t, { as_omarchy_theme: t.slug });
+  $('a-apply').href = aetherUrl(t, { silent: 'true' });
+  $('a-install').href = aetherUrl(t, { silent: 'true', as_omarchy_theme: t.slug });
   $('a-edit').href = aetherUrl(t, { edit: 'true' });
   const bg = view === 'wordmark' ? 'the wordmark background' : 'the native background';
-  $('a-hint').innerHTML = `Uses ${bg}. Needs <a href="https://github.com/omacom/aether">Aether</a>. Aether asks before it changes anything. Install stops if a theme named <code>${t.slug}</code> exists.`;
+  $('a-hint').innerHTML = `Uses ${bg}. Needs <a href="https://github.com/omacom/aether">Aether</a>. Apply and Install change your theme at once. Install stops if a theme named <code>${t.slug}</code> exists. Open in editor changes nothing until you select Apply.`;
 }
 function show(v) {
   view = v; const t = T[current];
@@ -448,6 +451,11 @@ $('d-prev').addEventListener('click', () => open(current - 1));
 $('d-next').addEventListener('click', () => open(current + 1));
 document.querySelector('.tabs').addEventListener('click', e => { const b = e.target.closest('.tab'); if (b) show(b.dataset.view); });
 $('d-sw').addEventListener('click', e => { const b = e.target.closest('.sw'); if (b) copy(b.dataset.hex, `Copied ${b.dataset.hex}`); });
+// The browser cannot tell if Aether accepted the link, so confirm the click only.
+document.querySelector('.aether').addEventListener('click', e => {
+  const a = e.target.closest('.a-btn'); if (!a) return;
+  toast(a.id === 'a-edit' ? 'Opening Aether' : 'Sent to Aether. The download takes a few seconds.', 3000);
+});
 document.addEventListener('click', e => { const b = e.target.closest('.copy'); if (b) copy(b.dataset.copy); });
 document.addEventListener('keydown', e => {
   if (!$('dlg').open) return;

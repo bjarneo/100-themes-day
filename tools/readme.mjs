@@ -174,19 +174,21 @@ The full repo is about ${sizeMb} MB because it has 200 backgrounds at 6K, 6144×
 
 | Button | Result |
 | --- | --- |
-| Apply with Aether | Aether loads the palette and the background, then applies them through its own theme |
-| Install as Omarchy theme | Aether adds the theme to \`~/.config/omarchy/themes\` and activates it. This stops if a theme with the same name exists. |
+| Apply with Aether | Aether loads the palette and the background, then applies them at once through its own theme. This works again and again. |
+| Install as Omarchy theme | Aether adds the theme to \`~/.config/omarchy/themes\` and activates it at once. This stops if a theme with the same name exists, for example after \`install.sh\`. |
 | Open in editor | Aether opens the palette in its editor. Nothing changes until you select Apply. |
 
-Aether shows a preview and asks before it changes anything. The link uses the background that you select in the gallery. The native background is the default. Aether reads \`mode = "light"\` from \`colors.toml\` and switches to light mode.
+Apply and Install use \`silent=true\`, like the links on the omarchy-themes site. They run at once, without the Aether window. The links use the background that you select in the gallery. The native background is the default.
+
+Aether stops a download after 60 seconds. On a slow connection, a 6K background can take longer, so the links download a 3840×2160 copy from \`assets/aether/\`. The largest copy is about 670 KB. Aether reads \`mode = "light"\` from \`colors.toml\` and switches to light mode.
 
 GitHub does not render \`aether://\` links, so use the gallery or build a link yourself:
 
 \`\`\`text
-aether://apply?colors=${SITE}/synthwave-day/colors.toml&wallpaper=${SITE}/synthwave-day/backgrounds/1-sunset-grid.jpg
+aether://apply?colors=${SITE}/synthwave-day/colors.toml&wallpaper=${SITE}/assets/aether/synthwave-day/1-sunset-grid.jpg&silent=true
 \`\`\`
 
-Add \`&as_omarchy_theme=synthwave-day\` to install the theme, or \`&edit=true\` to open the editor.
+Add \`&as_omarchy_theme=synthwave-day\` to install the theme, or \`&edit=true\` to open the editor. Leave out \`silent=true\` to see a preview in Aether first.
 
 ### Options
 
@@ -294,6 +296,7 @@ The \`tools/\` folder has every script that made this repo. You need Node.js 22 
 | --- | --- |
 | \`node tools/build.mjs\` | Writes \`colors.toml\`, \`icons.theme\` and \`assets/themes.js\` |
 | \`node tools/render.mjs [theme...]\` | Renders the backgrounds at 6144×3456 with headless Chromium. Set \`SIZE=3840x2160\` for another 16:9 size. |
+| \`node tools/aether.mjs\` | Writes the 3840×2160 copies in \`assets/aether\` that the Aether links download |
 | \`tools/capture.sh [theme...]\` | Applies each theme, takes a screenshot of workspace 7, and writes \`preview.png\` |
 | \`node tools/promo.mjs <song.mp3>\` | Renders \`assets/promo.mp4\` with one theme per beat |
 | \`node tools/readme.mjs\` | Writes this README |
